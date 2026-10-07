@@ -5,6 +5,7 @@
 
 const { Hono } = require('hono')
 const postgres = require('postgres')
+const { json } = postgres
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
@@ -412,7 +413,7 @@ app.post('/api/ai-quiz/generate', async (c) => {
       return c.json({ error: `今日生成次数已达上限（${AI_GEN_DAILY_LIMIT} 次），明天再来吧` }, 429)
     }
 
-    // 优先复用缓存题（省 token）
+    // 优先复用缓存题（省 token）；payload 兼容 jsonb 返回字符串的形态
     const cached = await sql`
       SELECT q_hash, payload FROM ai_quizzes
       WHERE chapter_id = ${chapterId} ORDER BY random() LIMIT ${count}
@@ -421,7 +422,10 @@ app.post('/api/ai-quiz/generate', async (c) => {
       return c.json({
         ok: true,
         cached: true,
-        questions: cached.map((r) => ({ id: r.q_hash, ...r.payload })),
+        questions: cached.map((r) => {
+          const p = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload
+          return { id: r.q_hash, ...p }
+        }),
       })
     }
 
@@ -435,7 +439,7 @@ app.post('/api/ai-quiz/generate', async (c) => {
       const qHash = hashQuestion(chapterId, q.question)
       await sql`
         INSERT INTO ai_quizzes (q_hash, chapter_id, payload)
-        VALUES (${qHash}, ${chapterId}, ${JSON.stringify({ ...q, id: qHash })}::jsonb)
+        VALUES (${qHash}, ${chapterId}, ${json({ ...q, id: qHash })})
         ON CONFLICT (q_hash) DO NOTHING
       `
     }
@@ -464,11 +468,12 @@ app.post('/api/ai-quiz/answer', async (c) => {
 
   try {
     await ensureSchema()
-    // 服务端缓存中的答案优先（客户端不可信）
+    // 服务端缓存中的答案优先（客户端不可信）；payload 兼容字符串形态
     const [stored] = await sql`SELECT payload FROM ai_quizzes WHERE q_hash = ${qHash}`
+    const storedPayload = stored && stored.payload ? (typeof stored.payload === 'string' ? JSON.parse(stored.payload) : stored.payload) : null
     const payload =
-      stored && stored.payload
-        ? stored.payload
+      storedPayload
+        ? storedPayload
         : {
             question: clean(body && body.question, 300),
             options: Array.isArray(body && body.options) ? body.options.slice(0, 4) : [],
@@ -481,11 +486,10 @@ app.post('/api/ai-quiz/answer', async (c) => {
     if (correct) {
       await sql`DELETE FROM ai_wrong_book WHERE device_id = ${deviceId} AND q_hash = ${qHash}`
     } else {
-      const payloadJson = JSON.stringify({ ...payload, picked })
       await sql`
         INSERT INTO ai_wrong_book (device_id, q_hash, chapter_id, payload)
-        VALUES (${deviceId}, ${qHash}, ${chapterId}, ${payloadJson}::jsonb)
-        ON CONFLICT (device_id, q_hash) DO UPDATE SET payload = ${payloadJson}::jsonb, created_at = now()
+        VALUES (${deviceId}, ${qHash}, ${chapterId}, ${json({ ...payload, picked })})
+        ON CONFLICT (device_id, q_hash) DO UPDATE SET payload = ${json({ ...payload, picked })}, created_at = now()
       `
     }
     return c.json({ ok: true, correct })
@@ -504,7 +508,13 @@ app.get('/api/ai-quiz/wrong', async (c) => {
       SELECT chapter_id, q_hash, payload, created_at FROM ai_wrong_book
       WHERE device_id = ${deviceId} ORDER BY created_at DESC LIMIT 100
     `
-    return c.json({ ok: true, items: rows })
+    return c.json({
+      ok: true,
+      items: rows.map((r) => ({
+        ...r,
+        payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload,
+      })),
+    })
   } catch (err) {
     return c.json({ ok: false, error: errText(err) }, 500)
   }
