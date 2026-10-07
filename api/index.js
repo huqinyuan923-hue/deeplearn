@@ -72,8 +72,10 @@ function ensureSchema() {
       await sql`CREATE TABLE IF NOT EXISTS ai_gen_log (
         device_id TEXT NOT NULL,
         chapter_id TEXT NOT NULL,
+        client_ip TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )`
+      await sql`ALTER TABLE ai_gen_log ADD COLUMN IF NOT EXISTS client_ip TEXT`
     })().catch((err) => {
       schemaPromise = null
       throw err
@@ -284,6 +286,7 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://open.bigmodel.cn/api/pa
 const AI_MODEL = process.env.AI_MODEL || 'glm-4-flash'
 const AI_API_KEY = process.env.AI_API_KEY || ''
 const AI_GEN_DAILY_LIMIT = 15
+const AI_GEN_IP_DAILY_LIMIT = 40
 
 // SSRF 防护：仅允许 https 协议 + 已知 LLM 服务商主机白名单
 const AI_HOST_ALLOWLIST = new Set([
@@ -408,13 +411,22 @@ app.post('/api/ai-quiz/generate', async (c) => {
   try {
     await ensureSchema()
 
-    // 每日限频：防止 key 被刷爆
+    const clientIp = (c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim() || 'unknown'
+
+    // 每日限频（双重）：按 device_id + 按 IP，防止伪造 device_id 刷爆 AI key
     const [used] = await sql`
       SELECT count(*)::int AS n FROM ai_gen_log
       WHERE device_id = ${deviceId} AND created_at > now() - interval '24 hours'
     `
     if (used.n >= AI_GEN_DAILY_LIMIT) {
       return c.json({ error: `今日生成次数已达上限（${AI_GEN_DAILY_LIMIT} 次），明天再来吧` }, 429)
+    }
+    const [usedByIp] = await sql`
+      SELECT count(*)::int AS n FROM ai_gen_log
+      WHERE client_ip = ${clientIp} AND created_at > now() - interval '24 hours'
+    `
+    if (usedByIp.n >= AI_GEN_IP_DAILY_LIMIT) {
+      return c.json({ error: '当前网络的今日生成次数已达上限，明天再来吧' }, 429)
     }
 
     // 优先复用缓存题（省 token）；payload 兼容 jsonb 返回字符串的形态
@@ -447,7 +459,7 @@ app.post('/api/ai-quiz/generate', async (c) => {
         ON CONFLICT (q_hash) DO NOTHING
       `
     }
-    await sql`INSERT INTO ai_gen_log (device_id, chapter_id) VALUES (${deviceId}, ${chapterId})`
+    await sql`INSERT INTO ai_gen_log (device_id, chapter_id, client_ip) VALUES (${deviceId}, ${chapterId}, ${clientIp})`
 
     return c.json({
       ok: true,
