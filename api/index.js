@@ -337,6 +337,41 @@ function hashQuestion(chapterId, question) {
   return crypto.createHash('sha256').update(`${chapterId}|${question}`).digest('hex').slice(0, 16)
 }
 
+/**
+ * 从 LLM 输出中提取第一个完整且合法的顶层 JSON 对象：
+ * 逐字符扫描括号深度（正确处理字符串与转义），避免模型在 JSON 前后
+ * 夹带说明文字或多个对象时解析失败。
+ */
+function extractFirstJsonObject(text) {
+  const start = text.indexOf('{')
+  if (start === -1) throw new Error('LLM 输出中未找到 JSON')
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1))
+        } catch (err) {
+          // 第一个对象不合法时继续向后扫描
+        }
+      }
+    }
+  }
+  throw new Error('LLM 返回的 JSON 不完整或非法')
+}
+
 /** 调用 OpenAI 兼容接口生成题目；严格校验返回的每道题 */
 async function callLlmForQuiz(chapterTitle, body, count) {
   if (!AI_API_KEY) throw new Error('AI_API_KEY 未配置（Vercel 环境变量）')
@@ -375,10 +410,7 @@ async function callLlmForQuiz(chapterTitle, body, count) {
 
   const data = await res.json().catch(() => null)
   const text = data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : ''
-  const stripped = String(text).split('```').join('').trim()
-  const start = stripped.indexOf('{')
-  const end = stripped.lastIndexOf('}')
-  const parsed = JSON.parse(stripped.slice(start, end + 1))
+  const parsed = extractFirstJsonObject(String(text))
   const list = Array.isArray(parsed) ? parsed : parsed.questions
   if (!Array.isArray(list)) throw new Error('LLM 返回格式异常')
 
