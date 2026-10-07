@@ -9,6 +9,7 @@ const LINKS = [
   { href: '/roadmap/', label: '学习路线' },
   { href: '/courses/', label: '课程' },
   { href: '/flashcards/', label: '抽认卡' },
+  { href: '/ai-quiz/', label: 'AI 出题' },
   { href: '/guestbook/', label: '留言板' },
 ]
 

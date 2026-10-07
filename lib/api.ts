@@ -111,3 +111,68 @@ export function postGuestbook(nickname: string, message: string): Promise<{ ok: 
     body: JSON.stringify({ nickname, message }),
   }).then((r) => r ?? { ok: false, error: '网络异常，请稍后再试' })
 }
+
+// ============ AI 出题官 ============
+
+export interface AiQuestion {
+  id: string
+  question: string
+  options: string[]
+  answer: number
+  explanation: string
+}
+
+export interface AiWrongItem {
+  chapter_id: string
+  q_hash: string
+  payload: { question: string; options: string[]; answer: number; explanation?: string; picked?: number }
+  created_at: string
+}
+
+export async function generateAiQuiz(
+  chapterId: string,
+  count: number,
+): Promise<{ ok?: boolean; cached?: boolean; questions?: AiQuestion[]; error?: string }> {
+  return api('/ai-quiz/generate', {
+    method: 'POST',
+    body: JSON.stringify({ device_id: getDeviceId(), chapter_id: chapterId, count }),
+  }).then((r) => r ?? { error: '网络异常，请稍后再试' })
+}
+
+export async function answerAiQuiz(input: {
+  chapterId: string
+  qHash: string
+  picked: number
+  question: string
+  options: string[]
+  answer: number
+  explanation: string
+}): Promise<{ ok?: boolean; correct?: boolean; error?: string }> {
+  return api('/ai-quiz/answer', {
+    method: 'POST',
+    body: JSON.stringify({
+      device_id: getDeviceId(),
+      chapter_id: input.chapterId,
+      q_hash: input.qHash,
+      picked: input.picked,
+      question: input.question,
+      options: input.options,
+      answer: input.answer,
+      explanation: input.explanation,
+    }),
+  }).then((r) => r ?? { error: '网络异常' })
+}
+
+export async function fetchWrongBook(): Promise<AiWrongItem[] | null> {
+  return api<{ ok: boolean; items: AiWrongItem[] }>(`/ai-quiz/wrong?device_id=${getDeviceId()}`).then(
+    (r) => r?.items ?? null,
+  )
+}
+
+export async function clearWrongBook(): Promise<boolean> {
+  const res = await api<{ ok: boolean }>('/ai-quiz/wrong/clear', {
+    method: 'POST',
+    body: JSON.stringify({ device_id: getDeviceId() }),
+  })
+  return !!res?.ok
+}

@@ -5,6 +5,10 @@
 
 const { Hono } = require('hono')
 const postgres = require('postgres')
+const fs = require('fs')
+const path = require('path')
+const crypto = require('crypto')
+const matter = require('gray-matter')
 
 const DATABASE_URL = process.env.DATABASE_URL || ''
 const sql = DATABASE_URL
@@ -46,6 +50,25 @@ function ensureSchema() {
         id BIGSERIAL PRIMARY KEY,
         nickname TEXT NOT NULL,
         message TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`
+      await sql`CREATE TABLE IF NOT EXISTS ai_quizzes (
+        q_hash TEXT PRIMARY KEY,
+        chapter_id TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`
+      await sql`CREATE TABLE IF NOT EXISTS ai_wrong_book (
+        device_id TEXT NOT NULL,
+        q_hash TEXT NOT NULL,
+        chapter_id TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (device_id, q_hash)
+      )`
+      await sql`CREATE TABLE IF NOT EXISTS ai_gen_log (
+        device_id TEXT NOT NULL,
+        chapter_id TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )`
     })().catch((err) => {
@@ -232,9 +255,271 @@ app.post('/api/guestbook', async (c) => {
   }
 })
 
+// ============ AI 出题官 ============
+// 章节白名单 → 内容文件相对路径（content/** 经 vercel.json includeFiles 打进函数包）
+const AI_CHAPTERS = {
+  'ai/llm-basics': 'ai/01-llm-basics.md',
+  'ai/prompting': 'ai/02-prompting.md',
+  'ai/rag': 'ai/03-rag.md',
+  'ai/agent': 'ai/04-agent.md',
+  'frontend/html-css': 'frontend/01-html-css.md',
+  'frontend/javascript': 'frontend/02-javascript.md',
+  'frontend/react': 'frontend/03-react.md',
+  'frontend/nextjs-deploy': 'frontend/04-nextjs-deploy.md',
+  'python/basics': 'python/01-basics.md',
+  'python/data-structures': 'python/02-data-structures.md',
+  'python/functions': 'python/03-functions.md',
+  'python/practice': 'python/04-practice.md',
+  'cs/data-representation': 'cs/01-data-representation.md',
+  'cs/algorithms': 'cs/02-algorithms.md',
+  'cs/network-git': 'cs/03-network-git.md',
+}
+
+const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4').replace(/\/+$/, '')
+const AI_MODEL = process.env.AI_MODEL || 'glm-4-flash'
+const AI_API_KEY = process.env.AI_API_KEY || ''
+const AI_GEN_DAILY_LIMIT = 15
+
+// SSRF 防护：仅允许 https 协议 + 已知 LLM 服务商主机白名单
+const AI_HOST_ALLOWLIST = new Set([
+  'open.bigmodel.cn',
+  'api.deepseek.com',
+  'api.openai.com',
+  'api.moonshot.cn',
+  'dashscope.aliyuncs.com',
+  'api.siliconflow.cn',
+])
+
+function aiChatEndpoint() {
+  let parsed = null
+  try {
+    parsed = new URL(`${AI_BASE_URL}/chat/completions`)
+  } catch (err) {
+    return null
+  }
+  if (parsed.protocol !== 'https:' || !AI_HOST_ALLOWLIST.has(parsed.hostname)) return null
+  return parsed.toString()
+}
+
+function readChapterContent(chapterId) {
+  const rel = AI_CHAPTERS[chapterId]
+  if (!rel) return null
+  try {
+    // 路径安全：resolve 后强制校验边界
+    const root = path.resolve(__dirname, 'content')
+    const target = path.resolve(root, rel)
+    if (target !== root && !target.startsWith(root + path.sep)) return null
+    const raw = fs.readFileSync(target, 'utf8')
+    const parsed = matter(raw)
+    // 正文截断到 ~6000 字符，控制 token 成本
+    return { title: parsed.data.title || chapterId, body: String(parsed.content || '').slice(0, 6000) }
+  } catch (err) {
+    return null
+  }
+}
+
+function hashQuestion(chapterId, question) {
+  return crypto.createHash('sha256').update(`${chapterId}|${question}`).digest('hex').slice(0, 16)
+}
+
+/** 调用 OpenAI 兼容接口生成题目；严格校验返回的每道题 */
+async function callLlmForQuiz(chapterTitle, body, count) {
+  if (!AI_API_KEY) throw new Error('AI_API_KEY 未配置（Vercel 环境变量）')
+  const endpoint = aiChatEndpoint()
+  if (!endpoint) throw new Error('AI_BASE_URL 不在允许的服务商白名单内')
+
+  const prompt = [
+    `你是一位严谨的中文编程老师。下面是《${chapterTitle}》一章的教学内容。`,
+    `请基于内容出 ${count} 道中文单选题，要求：`,
+    '1. 考查真实理解而非背诵原文；选项 A-D 互不混淆，干扰项合理；',
+    '2. answer 为正确选项的下标（0-3）；explanation 用一两句话解释为什么正确；',
+    '3. 只输出 JSON，格式：{"questions":[{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."}]}',
+    '',
+    '【教学内容】',
+    body,
+  ].join('\n')
+
+  const call = (withJsonMode) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: [
+          { role: 'system', content: '你是一位出题严谨的中文编程老师，只输出合法 JSON。' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.7,
+        ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
+      }),
+    })
+
+  let res = await call(true)
+  if (!res.ok && res.status >= 400) res = await call(false) // 部分模型不支持 json_object，降级重试
+  if (!res.ok) throw new Error(`LLM 接口错误 HTTP ${res.status}`)
+
+  const data = await res.json().catch(() => null)
+  const text = data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : ''
+  const stripped = String(text).split('```').join('').trim()
+  const start = stripped.indexOf('{')
+  const end = stripped.lastIndexOf('}')
+  const parsed = JSON.parse(stripped.slice(start, end + 1))
+  const list = Array.isArray(parsed) ? parsed : parsed.questions
+  if (!Array.isArray(list)) throw new Error('LLM 返回格式异常')
+
+  return list
+    .map((q) => ({
+      question: clean(q && q.question, 300),
+      options: Array.isArray(q && q.options) ? q.options.map((o) => clean(o, 200)).slice(0, 4) : [],
+      answer: Number(q && q.answer),
+      explanation: clean(q && q.explanation, 400),
+    }))
+    .filter(
+      (q) =>
+        q.question.length >= 5 &&
+        q.options.length === 4 &&
+        q.options.every((o) => o.length > 0) &&
+        Number.isInteger(q.answer) &&
+        q.answer >= 0 &&
+        q.answer <= 3,
+    )
+}
+
+app.post('/api/ai-quiz/generate', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const deviceId = body && body.device_id
+  const chapterId = clean(body && body.chapter_id, 128)
+  const count = Math.min(Math.max(Number(body && body.count) || 5, 1), 8)
+  if (!DEV_RE.test(deviceId || '') || !AI_CHAPTERS[chapterId]) return c.json({ error: 'invalid payload' }, 400)
+  if (!sql) return dbDown(c)
+
+  try {
+    await ensureSchema()
+
+    // 每日限频：防止 key 被刷爆
+    const [used] = await sql`
+      SELECT count(*)::int AS n FROM ai_gen_log
+      WHERE device_id = ${deviceId} AND created_at > now() - interval '24 hours'
+    `
+    if (used.n >= AI_GEN_DAILY_LIMIT) {
+      return c.json({ error: `今日生成次数已达上限（${AI_GEN_DAILY_LIMIT} 次），明天再来吧` }, 429)
+    }
+
+    // 优先复用缓存题（省 token）
+    const cached = await sql`
+      SELECT q_hash, payload FROM ai_quizzes
+      WHERE chapter_id = ${chapterId} ORDER BY random() LIMIT ${count}
+    `
+    if (cached.length >= count) {
+      return c.json({
+        ok: true,
+        cached: true,
+        questions: cached.map((r) => ({ id: r.q_hash, ...r.payload })),
+      })
+    }
+
+    const chapter = readChapterContent(chapterId)
+    if (!chapter) return c.json({ error: '章节内容不存在' }, 404)
+
+    const questions = await callLlmForQuiz(chapter.title, chapter.body, count)
+    if (!questions.length) return c.json({ error: 'AI 未能生成有效题目，请重试' }, 502)
+
+    for (const q of questions) {
+      const qHash = hashQuestion(chapterId, q.question)
+      await sql`
+        INSERT INTO ai_quizzes (q_hash, chapter_id, payload)
+        VALUES (${qHash}, ${chapterId}, ${JSON.stringify({ ...q, id: qHash })}::jsonb)
+        ON CONFLICT (q_hash) DO NOTHING
+      `
+    }
+    await sql`INSERT INTO ai_gen_log (device_id, chapter_id) VALUES (${deviceId}, ${chapterId})`
+
+    return c.json({
+      ok: true,
+      cached: false,
+      questions: questions.map((q) => ({ id: hashQuestion(chapterId, q.question), ...q })),
+    })
+  } catch (err) {
+    return c.json({ error: errText(err) }, 500)
+  }
+})
+
+app.post('/api/ai-quiz/answer', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const deviceId = body && body.device_id
+  const chapterId = clean(body && body.chapter_id, 128)
+  const qHash = clean(body && body.q_hash, 32)
+  const picked = Number(body && body.picked)
+  if (!DEV_RE.test(deviceId || '') || !chapterId || !/^[a-f0-9]{8,32}$/.test(qHash) || !Number.isInteger(picked)) {
+    return c.json({ error: 'invalid payload' }, 400)
+  }
+  if (!sql) return dbDown(c)
+
+  try {
+    await ensureSchema()
+    // 服务端缓存中的答案优先（客户端不可信）
+    const [stored] = await sql`SELECT payload FROM ai_quizzes WHERE q_hash = ${qHash}`
+    const payload =
+      stored && stored.payload
+        ? stored.payload
+        : {
+            question: clean(body && body.question, 300),
+            options: Array.isArray(body && body.options) ? body.options.slice(0, 4) : [],
+            answer: Number(body && body.answer),
+            explanation: clean(body && body.explanation, 400),
+          }
+    const answer = Number.isInteger(payload.answer) ? payload.answer : Number(body && body.answer)
+    const correct = picked === answer
+
+    if (correct) {
+      await sql`DELETE FROM ai_wrong_book WHERE device_id = ${deviceId} AND q_hash = ${qHash}`
+    } else {
+      const payloadJson = JSON.stringify({ ...payload, picked })
+      await sql`
+        INSERT INTO ai_wrong_book (device_id, q_hash, chapter_id, payload)
+        VALUES (${deviceId}, ${qHash}, ${chapterId}, ${payloadJson}::jsonb)
+        ON CONFLICT (device_id, q_hash) DO UPDATE SET payload = ${payloadJson}::jsonb, created_at = now()
+      `
+    }
+    return c.json({ ok: true, correct })
+  } catch (err) {
+    return c.json({ error: errText(err) }, 500)
+  }
+})
+
+app.get('/api/ai-quiz/wrong', async (c) => {
+  const deviceId = c.req.query('device_id') || ''
+  if (!DEV_RE.test(deviceId)) return c.json({ error: 'invalid device_id' }, 400)
+  if (!sql) return dbDown(c)
+  try {
+    await ensureSchema()
+    const rows = await sql`
+      SELECT chapter_id, q_hash, payload, created_at FROM ai_wrong_book
+      WHERE device_id = ${deviceId} ORDER BY created_at DESC LIMIT 100
+    `
+    return c.json({ ok: true, items: rows })
+  } catch (err) {
+    return c.json({ ok: false, error: errText(err) }, 500)
+  }
+})
+
+app.post('/api/ai-quiz/wrong/clear', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const deviceId = body && body.device_id
+  if (!DEV_RE.test(deviceId || '')) return c.json({ error: 'invalid payload' }, 400)
+  if (!sql) return dbDown(c)
+  try {
+    await ensureSchema()
+    await sql`DELETE FROM ai_wrong_book WHERE device_id = ${deviceId}`
+    return c.json({ ok: true })
+  } catch (err) {
+    return c.json({ ok: false, error: errText(err) }, 500)
+  }
+})
+
 app.notFound((c) => c.json({ error: 'not found' }, 404))
 app.onError((err, c) => c.json({ error: errText(err) }, 500))
 
-exports.config = { runtime: 'nodejs', maxDuration: 15 }
+exports.config = { runtime: 'nodejs', maxDuration: 60 }
 
 exports.fetch = (request) => app.fetch(request)
