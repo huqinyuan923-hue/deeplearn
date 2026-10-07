@@ -461,19 +461,24 @@ app.post('/api/ai-quiz/generate', async (c) => {
       return c.json({ error: '当前网络的今日生成次数已达上限，明天再来吧' }, 429)
     }
 
-    // 优先复用缓存题（省 token）；payload 兼容 jsonb 返回字符串的形态
+    // 优先复用缓存题（省 token）；payload 兼容 jsonb 返回字符串的形态，
+    // 并过滤掉缺少合法答案的脏数据，不足时回退到现场生成
     const cached = await sql`
       SELECT q_hash, payload FROM ai_quizzes
       WHERE chapter_id = ${chapterId} ORDER BY random() LIMIT ${count}
     `
-    if (cached.length >= count) {
+    const cachedQuestions = cached
+      .map((r) => {
+        const p = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload
+        return { id: r.q_hash, ...p }
+      })
+      .filter((p) => Number.isInteger(p.answer) && p.answer >= 0 && p.answer <= 3 && Array.isArray(p.options) && p.options.length === 4)
+
+    if (cachedQuestions.length >= count) {
       return c.json({
         ok: true,
         cached: true,
-        questions: cached.map((r) => {
-          const p = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload
-          return { id: r.q_hash, ...p }
-        }),
+        questions: cachedQuestions.slice(0, count),
       })
     }
 
@@ -487,7 +492,7 @@ app.post('/api/ai-quiz/generate', async (c) => {
       const qHash = hashQuestion(chapterId, q.question)
       await sql`
         INSERT INTO ai_quizzes (q_hash, chapter_id, payload)
-        VALUES (${qHash}, ${chapterId}, ${json({ ...q, id: qHash })})
+        VALUES (${qHash}, ${chapterId}, ${JSON.stringify({ ...q, id: qHash })}::jsonb)
         ON CONFLICT (q_hash) DO NOTHING
       `
     }
