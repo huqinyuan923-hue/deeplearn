@@ -109,7 +109,7 @@ export default function RoadmapView({ tracks }: { tracks: RoadmapTrack[] }) {
                       </div>
                       <Link
                         href={`/courses/${track.id}/${c.slug}/`}
-                        className="group mb-2 flex flex-1 items-center justify-between gap-3 rounded-xl border border-transparent px-3.5 py-3 transition hover:border-indigo-100 hover:bg-indigo-50/40"
+                        className="group mb-2 flex min-w-0 flex-1 items-center justify-between gap-3 rounded-xl border border-transparent px-3.5 py-3 transition hover:border-indigo-100 hover:bg-indigo-50/40"
                       >
                         <div className="min-w-0">
                           <p className={`text-sm font-semibold ${isDone ? 'text-slate-400 line-through' : 'text-slate-900'}`}>
