@@ -304,18 +304,25 @@ function aiChatEndpoint() {
 function readChapterContent(chapterId) {
   const rel = AI_CHAPTERS[chapterId]
   if (!rel) return null
-  try {
-    // 路径安全：resolve 后强制校验边界
-    const root = path.resolve(__dirname, 'content')
-    const target = path.resolve(root, rel)
-    if (target !== root && !target.startsWith(root + path.sep)) return null
-    const raw = fs.readFileSync(target, 'utf8')
-    const parsed = matter(raw)
-    // 正文截断到 ~6000 字符，控制 token 成本
-    return { title: parsed.data.title || chapterId, body: String(parsed.content || '').slice(0, 6000) }
-  } catch (err) {
-    return null
+  // includeFiles 打包位置因 Vercel 版本而异，逐个候选根尝试
+  const roots = [
+    path.resolve(__dirname, 'content'),
+    path.resolve(__dirname, '..', 'content'),
+    path.resolve(process.cwd(), 'content'),
+  ]
+  for (const root of roots) {
+    try {
+      const target = path.resolve(root, rel)
+      if (target !== root && !target.startsWith(root + path.sep)) continue
+      const raw = fs.readFileSync(target, 'utf8')
+      const parsed = matter(raw)
+      // 正文截断到 ~6000 字符，控制 token 成本
+      return { title: parsed.data.title || chapterId, body: String(parsed.content || '').slice(0, 6000) }
+    } catch (err) {
+      // 尝试下一个根
+    }
   }
+  return null
 }
 
 function hashQuestion(chapterId, question) {
