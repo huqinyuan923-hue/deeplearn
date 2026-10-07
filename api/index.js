@@ -541,8 +541,8 @@ app.post('/api/ai-quiz/answer', async (c) => {
     } else {
       await sql`
         INSERT INTO ai_wrong_book (device_id, q_hash, chapter_id, payload)
-        VALUES (${deviceId}, ${qHash}, ${chapterId}, ${json({ ...payload, picked })})
-        ON CONFLICT (device_id, q_hash) DO UPDATE SET payload = ${json({ ...payload, picked })}, created_at = now()
+        VALUES (${deviceId}, ${qHash}, ${chapterId}, ${JSON.stringify({ ...payload, picked })}::jsonb)
+        ON CONFLICT (device_id, q_hash) DO UPDATE SET payload = ${JSON.stringify({ ...payload, picked })}::jsonb, created_at = now()
       `
     }
     return c.json({ ok: true, correct })
