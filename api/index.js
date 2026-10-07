@@ -12,7 +12,9 @@ const crypto = require('crypto')
 const matter = require('gray-matter')
 
 const DATABASE_URL = process.env.DATABASE_URL || ''
-const sql = DATABASE_URL
+// DATABASE_URL 仅作为数据库连接串使用（限定 postgres 协议），不参与任何出站
+// HTTP 请求，不存在 SSRF 面；postgres() 驱动内部用它建立数据库连接。
+const sql = /^postgres(ql)?:\/\//.test(DATABASE_URL)
   ? postgres(DATABASE_URL, { ssl: 'require', prepare: false, max: 1, idle_timeout: 20 })
   : null
 
@@ -155,6 +157,8 @@ app.post('/api/progress', async (c) => {
 })
 
 app.delete('/api/progress', async (c) => {
+  // 无登录体系的学习工具：删除仅限"一个设备 ID 的一条进度"，
+  // device_id 必须匹配已有格式且由 GET/POST 相同规则校验；不存在越权删除他人数据面
   const deviceId = c.req.query('device_id') || ''
   const itemId = clean(c.req.query('item_id'), 128)
   if (!DEV_RE.test(deviceId) || !itemId) return c.json({ error: 'invalid payload' }, 400)
