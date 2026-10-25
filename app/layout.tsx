@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import Link from 'next/link'
 import './globals.css'
 import Nav from '@/components/Nav'
+import { EntranceOverlay } from '@/components/entrance-overlay'
 
 export const metadata: Metadata = {
   title: {
@@ -17,7 +18,14 @@ const GITHUB_URL = 'https://github.com/huqinyuan923-hue/deeplearn'
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
+      {/* 进站动画会话标记：水合前执行（每会话一次） */}
+      <script
+        dangerouslySetInnerHTML={{
+          __html: `try{if(sessionStorage.getItem('boot-seen')){document.documentElement.dataset.boot='done'}else{sessionStorage.setItem('boot-seen','1')}}catch(e){}`,
+        }}
+      />
       <body className="flex min-h-screen flex-col bg-slate-50 text-slate-900 antialiased">
+        <EntranceOverlay />
         <Nav />
         <main className="flex-1">{children}</main>
         <footer className="border-t border-slate-200 bg-white">
